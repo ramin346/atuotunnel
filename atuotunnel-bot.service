@@ -1,0 +1,21 @@
+[Unit]
+Description=BackPack Smart Tunnel Manager Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=atuotunnel
+Group=atuotunnel
+WorkingDirectory=/opt/atuotunnel
+EnvironmentFile=/etc/atuotunnel-bot.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 /opt/atuotunnel/bot.py
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
