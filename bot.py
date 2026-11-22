@@ -175,7 +175,7 @@ class Bot:
                 label = f"server-{index}"
         if label not in inventory and label in self.available_servers():
             raise ValueError("این نام برای یک سرور اختصاص‌یافته استفاده شده است.")
-        remote(host, "online", password=password, ports=[])
+        remote(host, "online", password=password, first_connection=True, ports=[])
         if password:
             save_password(host, password)
         else:

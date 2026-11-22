@@ -71,7 +71,7 @@ def save_password(host, password):
             Path(file.name).unlink(missing_ok=True)
 
 
-def remote(host, action, *, password=None, **data):
+def remote(host, action, *, password=None, first_connection=False, **data):
     source = (ROOT / "remote.py").read_text()
     privilege = "" if host["user"] == "root" else "sudo -n "
     command = privilege + "python3 -c " + shlex.quote(source)
@@ -80,8 +80,9 @@ def remote(host, action, *, password=None, **data):
         password = secret.read_text(encoding="utf-8") if secret.is_file() else ""
     if not password and host.get("credential_owner") is not None:
         raise RuntimeError("رمز SSH این سرور ثبت نشده است.")
+    host_check = "accept-new" if first_connection else "yes"
     args = [
-        "ssh", "-o", "StrictHostKeyChecking=yes",
+        "ssh", "-o", f"StrictHostKeyChecking={host_check}",
         "-o", "ConnectTimeout=5", "-o", "ConnectionAttempts=1",
         "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
         "-o", "ClearAllForwardings=yes", "-p", str(host["port"]),
