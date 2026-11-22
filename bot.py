@@ -9,13 +9,14 @@ import subprocess
 import time
 from urllib.request import Request, urlopen
 
-from manager import State, benchmark, endpoint, mappings, name, port, remote
+from manager import (State, benchmark, credential_path, endpoint, mappings, name, port,
+                     remote, save_password)
 from updater import update
 
 ADMIN_HELP = """🎒 BackPack Smart Tunnel Manager
 
 ثبت یا ویرایش سرور:
-/server NAME IP SSH_PORT USER
+/server — ثبت مرحله‌ای سرور
 
 ایجاد پیش‌نویس:
 /new TUNNEL IRAN ABROAD CONTROL_PORT
@@ -63,7 +64,7 @@ BUTTONS = {
     "license-issue": ("صدور لایسنس", "/license issue", "تعداد روزهای اعتبار را وارد کنید."),
     "license-list": ("فهرست لایسنس‌ها", "/license list", None),
     "license-revoke": ("لغو لایسنس", "/license revoke", "کد لایسنس برای لغو را وارد کنید."),
-    "server": ("ثبت سرور", "/server", "نام، IP، پورت و نام کاربری SSH را وارد کنید."),
+    "server": ("ثبت سرور", "/server", None),
     "grant": ("دسترسی سرورها", "/grant", "شناسهٔ عددی کاربر و نام سرورهای مجاز را وارد کنید."),
     "update": ("به‌روزرسانی ربات", "/update", None),
     "confirm-update": ("تأیید به‌روزرسانی", "/update", None),
@@ -75,7 +76,7 @@ COMMON_ROWS = (("new", "ports"), ("test", "install"), ("serverlist", "tunnels"),
 
 
 def keyboard(admin):
-    rows = COMMON_ROWS + ADMIN_ROWS if admin else (("activate",),) + COMMON_ROWS
+    rows = COMMON_ROWS + ADMIN_ROWS if admin else (("activate", "server"),) + COMMON_ROWS
     return {"inline_keyboard": [
         [{"text": BUTTONS[key][0], "callback_data": key} for key in row] for row in rows
     ]}
@@ -112,6 +113,7 @@ class Bot:
         self.directory = state.root.data
         self.servers = self.directory.setdefault("servers", {})
         self.prompts = {}
+        self.server_form = {}
         self.sessions = {}
         self.repair_attempts = {}
         self.last_health = {}
@@ -120,7 +122,8 @@ class Bot:
         if self.user is None:
             return self.servers
         allowed = self.directory.get("grants", {}).get(str(self.user), [])
-        return {label: self.servers[label] for label in allowed if label in self.servers}
+        shared = {label: self.servers[label] for label in allowed if label in self.servers}
+        return {**shared, **self.data.get("servers", {})}
 
     def valid_license(self):
         code = self.data.get("active_license")
@@ -150,7 +153,73 @@ class Bot:
         owners[code] = self.user
         self.data["active_license"] = code
         self.state.save()
-        return "لایسنس فعال شد. سرورهای اختصاص‌یافته را در «سرورهای من» ببینید."
+        return "لایسنس فعال شد. سرورها را در «سرورهای من» ببینید یا با دکمهٔ «ثبت سرور» سرور خودتان را اضافه کنید."
+
+    def start_server_form(self, label=None):
+        self.require_access()
+        self.server_form = {"step": "ip", "label": name(label) if label is not None else None}
+        return "آدرس IP سرور را بفرستید. برای پورت غیراستاندارد، IP:PORT یا [IPv6]:PORT را وارد کنید. /cancel برای لغو"
+
+    def register_server(self, label, host, password):
+        self.require_access()
+        if self.user is not None:
+            host["credential_owner"] = self.user
+        inventory = self.servers if self.user is None else self.data.setdefault("servers", {})
+        if label is None:
+            label = next((key for key, saved in inventory.items() if saved == host), None)
+            if label is None:
+                used = self.available_servers()
+                index = 1
+                while f"server-{index}" in used:
+                    index += 1
+                label = f"server-{index}"
+        if label not in inventory and label in self.available_servers():
+            raise ValueError("این نام برای یک سرور اختصاص‌یافته استفاده شده است.")
+        remote(host, "online", password=password, ports=[])
+        if password:
+            save_password(host, password)
+        else:
+            credential_path(host).unlink(missing_ok=True)
+        inventory[label] = host
+        self.state.save()
+        return f"✅ اتصال SSH تأیید شد و سرور با نام {label} ثبت شد."
+
+    def continue_server_form(self, text, chat, message):
+        form = self.server_form
+        if form["step"] != "password":
+            self.require_access()
+        if form["step"] == "ip":
+            value = text.strip()
+            address, ssh_port = value, "22"
+            if value.startswith("[") and "]:" in value:
+                address, ssh_port = value[1:].split("]:", 1)
+            elif value.count(":") == 1:
+                address, ssh_port = value.split(":", 1)
+            host = endpoint(address, ssh_port, "root")
+            form.update(step="user", ip=host["ip"], port=host["port"])
+            return "نام کاربری SSH را بفرستید."
+        if form["step"] == "user":
+            form["host"] = endpoint(form["ip"], form["port"], text.strip())
+            form["step"] = "password"
+            return ("رمز SSH را بفرستید." if self.user is not None else
+                    "رمز SSH را بفرستید. اگر از کلید ازپیش‌تنظیم‌شده استفاده می‌کنید، /key بزنید.")
+        use_key = self.user is None and text == "/key"
+        if not use_key:
+            try:
+                self.tg.call("deleteMessage", chat_id=chat, message_id=message)
+            except RuntimeError:
+                logging.warning("Could not delete SSH password message")
+            if not text or any(ch in text for ch in "\r\n\0") or len(text.encode()) > 1024:
+                raise ValueError("رمز معتبر را در یک خط بفرستید.")
+        self.require_access()
+        self.tg.send(chat, "در حال بررسی اتصال SSH…")
+        try:
+            reply = self.register_server(form["label"], form["host"], "" if use_key else text)
+        except (RuntimeError, OSError, subprocess.SubprocessError):
+            return ("❌ ثبت سرور انجام نشد. IP، پورت، نام کاربری، روش احراز هویت و کلید میزبان را بررسی کنید. "
+                    "برای آزمون دوباره رمز را بفرستید یا با /cancel فرم را ببندید.")
+        self.server_form = {}
+        return reply
 
     def execute(self, command, args, chat):
         if command in {"/start", "/help"}:
@@ -161,7 +230,7 @@ class Bot:
         if self.user is not None:
             if command == "/activate" and len(args) == 1:
                 return self.activate(args[0])
-            if command in {"/server", "/grant", "/update", "/license", "/recover"}:
+            if command in {"/grant", "/update", "/license", "/recover"}:
                 raise ValueError("این دستور در اختیار مدیر ربات است.")
             if command in {"/new", "/ports", "/test", "/install", "/repair", "/rollback"}:
                 self.require_access()
@@ -181,13 +250,14 @@ class Bot:
             self.directory.setdefault("grants", {})[user] = labels
             self.state.save()
             return f"سرورهای مجاز {user} · " + (", ".join(labels) or "بدون دسترسی")
-        if command == "/server" and len(args) == 4:
+        if command == "/server" and len(args) <= 1:
+            return self.start_server_form(args[0] if args else None)
+        if command == "/server" and len(args) == 4 and self.user is None:
             label = name(args[0])
-            host = endpoint(*args[1:])
-            remote(host, "online", ports=[])
-            self.servers[label] = host
-            self.state.save()
-            return f"سرور {label} ثبت شد. احراز هویت SSH با کلید انجام شد."
+            return self.register_server(label, endpoint(*args[1:]), "")
+        if command == "/cancel" and not args:
+            self.server_form = {}
+            return "فرم لغو شد."
         if command == "/serverlist" and not args:
             return "\n".join(f"{label} · {host['user']} @ {host['ip']} · SSH {host['port']}"
                              for label, host in self.available_servers().items()) or "سروری ثبت نشده است."
@@ -410,6 +480,7 @@ class Bot:
                     allowed.update((*LICENSE_BUTTONS, "confirm-update"))
                 if key not in allowed:
                     return False
+                session.server_form = {}
                 if key == "license":
                     submenu = {"inline_keyboard": [
                         [{"text": BUTTONS[item][0], "callback_data": item}] for item in LICENSE_BUTTONS
@@ -431,10 +502,19 @@ class Bot:
                     return False
                 command, *args = command.split()
             else:
-                tokens = msg.get("text", "").split()
+                message_text = msg.get("text")
+                if not message_text:
+                    return False
+                if session.server_form and message_text not in {"/cancel", "/start", "/help"}:
+                    reply = session.continue_server_form(message_text, user, msg["message_id"])
+                    self.tg.send(user, reply, markup if not session.server_form else None)
+                    return False
+                tokens = message_text.split()
                 if not tokens:
                     return False
                 if tokens[0].startswith("/"):
+                    if tokens[0] in {"/start", "/help"}:
+                        session.server_form = {}
                     self.prompts.pop(user, None)
                     command, *args = tokens
                     command = command.split("@")[0]
@@ -451,7 +531,7 @@ class Bot:
         if reply is None:
             return True
         try:
-            self.tg.send(user, reply, markup)
+            self.tg.send(user, reply, markup if not session.server_form else None)
         except RuntimeError:
             logging.warning("Could not send command response")
         return False

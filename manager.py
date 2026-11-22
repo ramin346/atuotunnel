@@ -1,4 +1,5 @@
 """BackPack deployment lifecycle and bounded path comparison."""
+import hashlib
 from ipaddress import ip_address
 import json
 import os
@@ -50,19 +51,63 @@ def mappings(value):
     return [[source, target] for source, target in pairs.items()]
 
 
-def remote(host, action, **data):
+def credential_path(host):
+    identity = [host.get("credential_owner"), host["ip"], host["port"], host["user"]]
+    digest = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+    state = Path(os.environ.get("BOT_STATE", "/var/lib/atuotunnel/state.json"))
+    return state.parent / "ssh-credentials" / digest
+
+
+def save_password(host, password):
+    path = credential_path(host)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as file:
+        try:
+            file.write(password.encode())
+            file.flush()
+            os.fsync(file.fileno())
+            os.replace(file.name, path)
+        finally:
+            Path(file.name).unlink(missing_ok=True)
+
+
+def remote(host, action, *, password=None, **data):
     source = (ROOT / "remote.py").read_text()
     privilege = "" if host["user"] == "root" else "sudo -n "
     command = privilege + "python3 -c " + shlex.quote(source)
+    if password is None:
+        secret = credential_path(host)
+        password = secret.read_text(encoding="utf-8") if secret.is_file() else ""
+    if not password and host.get("credential_owner") is not None:
+        raise RuntimeError("رمز SSH این سرور ثبت نشده است.")
     args = [
-        "ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+        "ssh", "-o", "StrictHostKeyChecking=yes",
         "-o", "ConnectTimeout=5", "-o", "ConnectionAttempts=1",
         "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
         "-o", "ClearAllForwardings=yes", "-p", str(host["port"]),
         "-l", host["user"], "--", host["ip"], command,
     ]
-    process = subprocess.run(args, input=json.dumps({"action": action, **data}),
-                             text=True, capture_output=True, timeout=45)
+    request = json.dumps({"action": action, **data})
+    options = {"input": request, "text": True, "capture_output": True, "timeout": 45}
+    if password:
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            helper = directory / "askpass"
+            helper.write_text(
+                "#!/usr/bin/python3\nimport os, sys\nfrom pathlib import Path\n"
+                "sys.stdout.buffer.write(Path(os.environ['ATUOTUNNEL_ASKPASS_FILE']).read_bytes() + b'\\n')\n"
+            )
+            helper.chmod(0o700)
+            secret = directory / "password"
+            secret.write_bytes(password.encode())
+            env = {**os.environ, "SSH_ASKPASS": str(helper), "SSH_ASKPASS_REQUIRE": "force",
+                   "ATUOTUNNEL_ASKPASS_FILE": str(secret)}
+            args[1:1] = ["-F", "/dev/null", "-o", "BatchMode=no", "-o", "NumberOfPasswordPrompts=1",
+                         "-o", "PreferredAuthentications=password", "-o", "PubkeyAuthentication=no"]
+            process = subprocess.run(args, env=env, **options)
+    else:
+        args[1:1] = ["-o", "BatchMode=yes"]
+        process = subprocess.run(args, **options)
     if process.returncode:
         # Keep raw SSH and remote command output out of Telegram.
         raise RuntimeError(f"عملیات {action} روی {host['ip']} ناموفق بود.")
