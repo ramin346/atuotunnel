@@ -12,7 +12,7 @@ from urllib.request import Request, urlopen
 from manager import State, benchmark, endpoint, mappings, name, port, remote
 from updater import update
 
-MENU = """🎒 BackPack Smart Tunnel Manager
+ADMIN_HELP = """🎒 BackPack Smart Tunnel Manager
 
 ثبت یا ویرایش سرور:
 /server NAME IP SSH_PORT USER
@@ -38,8 +38,47 @@ MENU = """🎒 BackPack Smart Tunnel Manager
 /rollback TUNNEL — بازگشت به نسخهٔ قبل
 /recover — تکمیل بازگردانی متوقف‌شده
 /license — مدیریت لایسنس محلی
+/grant USER_ID SERVER... — تعیین سرورهای مجاز کاربر
 /update — دریافت نسخهٔ جدید ربات از GitHub
 """
+
+
+USER_HELP = """🎒 BackPack Smart Tunnel Manager
+لایسنس را فعال کنید و برای ساخت تانل از سرورهای اختصاص‌یافته استفاده کنید.
+شناسهٔ تلگرام شما: {user}
+"""
+
+BUTTONS = {
+    "new": ("ایجاد تانل", "/new", "نام تانل، نام سرور ایران، نام سرور خارج و پورت کنترل را وارد کنید.\nنمونه: xray ir de 3080"),
+    "ports": ("مدیریت پورت‌ها", "/ports", "نام تانل و نگاشت پورت‌ها را وارد کنید.\nنمونه: xray 443,8443,2053:3000"),
+    "test": ("تست هوشمند", "/test", "نام تانل را وارد کنید. برای نصب خودکار پس از تست، auto را اضافه کنید."),
+    "install": ("تأیید نصب", "/install", "نام تانل تست‌شده را وارد کنید."),
+    "serverlist": ("سرورهای من", "/serverlist", None),
+    "tunnels": ("تانل‌های من", "/tunnels", None),
+    "status": ("وضعیت تانل", "/status", "نام تانل را وارد کنید."),
+    "repair": ("تعمیر خودکار", "/repair", "نام تانل و on یا off را وارد کنید.\nنمونه: xray on"),
+    "rollback": ("بازگشت تنظیمات", "/rollback", "نام تانل را برای بازگردانی وارد کنید."),
+    "activate": ("فعال‌سازی لایسنس", "/activate", "کد لایسنس را وارد کنید."),
+    "license": ("مدیریت لایسنس", "/license", None),
+    "license-issue": ("صدور لایسنس", "/license issue", "تعداد روزهای اعتبار را وارد کنید."),
+    "license-list": ("فهرست لایسنس‌ها", "/license list", None),
+    "license-revoke": ("لغو لایسنس", "/license revoke", "کد لایسنس برای لغو را وارد کنید."),
+    "server": ("ثبت سرور", "/server", "نام، IP، پورت و نام کاربری SSH را وارد کنید."),
+    "grant": ("دسترسی سرورها", "/grant", "شناسهٔ عددی کاربر و نام سرورهای مجاز را وارد کنید."),
+    "update": ("به‌روزرسانی ربات", "/update", None),
+    "confirm-update": ("تأیید به‌روزرسانی", "/update", None),
+}
+LICENSE_BUTTONS = ("license-issue", "license-list", "license-revoke")
+ADMIN_ROWS = (("server", "grant"), ("license", "update"))
+COMMON_ROWS = (("new", "ports"), ("test", "install"), ("serverlist", "tunnels"),
+               ("status", "repair"), ("rollback",))
+
+
+def keyboard(admin):
+    rows = COMMON_ROWS + ADMIN_ROWS if admin else (("activate",),) + COMMON_ROWS
+    return {"inline_keyboard": [
+        [{"text": BUTTONS[key][0], "callback_data": key} for key in row] for row in rows
+    ]}
 
 
 class Telegram:
@@ -56,25 +95,92 @@ class Telegram:
             # urllib exceptions may contain the URL and bot token.
             raise RuntimeError("ارتباط با API تلگرام برقرار نشد.") from None
 
-    def send(self, chat, message):
+    def send(self, chat, message, markup=None):
         while message:
-            self.call("sendMessage", chat_id=chat, text=message[:3500])
-            message = message[3500:]
+            chunk, message = message[:3500], message[3500:]
+            options = {"reply_markup": markup} if markup and not message else {}
+            self.call("sendMessage", chat_id=chat, text=chunk, **options)
 
 
 class Bot:
-    def __init__(self, state, telegram, admins):
+    def __init__(self, state, telegram, admins, user=None):
         self.state = state
         self.data = state.data
         self.tg = telegram
         self.admins = admins
-        self.servers = self.data.setdefault("servers", {})
+        self.user = user
+        self.directory = state.root.data
+        self.servers = self.directory.setdefault("servers", {})
+        self.prompts = {}
+        self.sessions = {}
         self.repair_attempts = {}
         self.last_health = {}
 
+    def available_servers(self):
+        if self.user is None:
+            return self.servers
+        allowed = self.directory.get("grants", {}).get(str(self.user), [])
+        return {label: self.servers[label] for label in allowed if label in self.servers}
+
+    def valid_license(self):
+        code = self.data.get("active_license")
+        return (self.directory.get("license_owners", {}).get(code) == self.user
+                and self.directory["licenses"].get(code, 0) > time.time())
+
+    def require_access(self, plan=None):
+        if self.user is None:
+            return
+        if not self.valid_license():
+            raise ValueError("برای این عملیات ابتدا لایسنس معتبر فعال کنید.")
+        if plan and not self.has_servers(plan):
+            raise ValueError("دسترسی به سرورهای این تانل را از مدیر دریافت کنید.")
+
+    def has_servers(self, plan):
+        if self.user is None:
+            return True
+        available = self.available_servers().values()
+        return all(plan[side] in available for side in ("iran", "abroad"))
+
+    def activate(self, code):
+        if self.directory["licenses"].get(code, 0) <= time.time():
+            raise ValueError("لایسنس نامعتبر، منقضی یا لغوشده است.")
+        owners = self.directory.setdefault("license_owners", {})
+        if owners.get(code, self.user) != self.user:
+            raise ValueError("این لایسنس قبلاً برای حساب دیگری فعال شده است.")
+        owners[code] = self.user
+        self.data["active_license"] = code
+        self.state.save()
+        return "لایسنس فعال شد. سرورهای اختصاص‌یافته را در «سرورهای من» ببینید."
+
     def execute(self, command, args, chat):
         if command in {"/start", "/help"}:
-            return MENU
+            if self.user is None:
+                return ADMIN_HELP
+            license_status = "فعال" if self.valid_license() else "نیازمند فعال‌سازی"
+            return USER_HELP.format(user=self.user) + f"وضعیت لایسنس: {license_status}"
+        if self.user is not None:
+            if command == "/activate" and len(args) == 1:
+                return self.activate(args[0])
+            if command in {"/server", "/grant", "/update", "/license", "/recover"}:
+                raise ValueError("این دستور در اختیار مدیر ربات است.")
+            if command in {"/new", "/ports", "/test", "/install", "/repair", "/rollback"}:
+                self.require_access()
+                if command != "/new" and args:
+                    key = name(args[0])
+                    for plan in (self.data["drafts"].get(key), self.data["live"].get(key),
+                                 self.data["previous"].get(key, {}).get("plan")):
+                        if plan:
+                            self.require_access(plan)
+        if command == "/grant" and args:
+            user = str(int(args[0]))
+            if int(user) <= 0:
+                raise ValueError("شناسهٔ تلگرام باید مثبت باشد.")
+            labels = list(dict.fromkeys(args[1:]))
+            if any(label not in self.servers for label in labels):
+                raise ValueError("ابتدا سرورها را با /server ثبت کنید.")
+            self.directory.setdefault("grants", {})[user] = labels
+            self.state.save()
+            return f"سرورهای مجاز {user} · " + (", ".join(labels) or "بدون دسترسی")
         if command == "/server" and len(args) == 4:
             label = name(args[0])
             host = endpoint(*args[1:])
@@ -84,16 +190,19 @@ class Bot:
             return f"سرور {label} ثبت شد. احراز هویت SSH با کلید انجام شد."
         if command == "/serverlist" and not args:
             return "\n".join(f"{label} · {host['user']} @ {host['ip']} · SSH {host['port']}"
-                             for label, host in self.servers.items()) or "سروری ثبت نشده است."
+                             for label, host in self.available_servers().items()) or "سروری ثبت نشده است."
         if command == "/new" and len(args) == 4:
             label, iran, abroad, control = args
             label = name(label)
             if label in self.data["live"]:
                 raise ValueError("برای تانل فعال، پورت‌ها را با /ports ویرایش کنید.")
-            if self.servers[iran]["ip"] == self.servers[abroad]["ip"]:
+            servers = self.available_servers()
+            if iran not in servers or abroad not in servers:
+                raise ValueError("نام دو سرور مجاز را از بخش «سرورهای من» انتخاب کنید.")
+            if servers[iran]["ip"] == servers[abroad]["ip"]:
                 raise ValueError("برای این تانل دو سرور متفاوت تعریف کنید.")
             self.data["drafts"][label] = {
-                "iran": self.servers[iran], "abroad": self.servers[abroad],
+                "iran": servers[iran], "abroad": servers[abroad],
                 "control": port(control), "token": secrets.token_hex(32), "ports": [],
             }
             self.state.save()
@@ -129,6 +238,7 @@ class Bot:
                 metric = f" · {seconds * 1000:.1f} ms · {0.524288 / seconds:.2f} Mbps رفت" if seconds else ""
                 lines.append(f"{method} · {report['success']}/3 نمونهٔ موفق{metric}")
             if len(args) == 2:
+                self.require_access(plan)
                 self.state.deploy(label)
                 lines.append("نصب و بررسی سلامت انجام شد.")
             else:
@@ -140,6 +250,8 @@ class Bot:
         if command == "/status" and len(args) == 1:
             label = name(args[0])
             plan = self.data["live"][label]
+            if not self.has_servers(plan):
+                raise ValueError("دسترسی به سرورهای این تانل را از مدیر دریافت کنید.")
             status = "سالم" if self.state.healthy(label, plan) else "نیازمند بررسی"
             return f"{label} · {plan['transport']} · {status}"
         if command == "/repair" and len(args) == 2 and args[1] in {"on", "off"}:
@@ -157,8 +269,9 @@ class Bot:
         if command == "/rollback" and len(args) == 1:
             self.state.rollback(name(args[0]))
             return "تنظیمات قبلی بازگردانده شد."
-        if command == "/recover" and not args:
-            self.state.recover()
+        if command == "/recover" and len(args) <= 1:
+            state = self.state.scoped(int(args[0])) if args else self.state
+            state.recover()
             return "بازگردانی معوقی وجود ندارد."
         if command == "/license":
             return self.license(args)
@@ -205,6 +318,8 @@ class Bot:
         if self.data["pending"]:
             return
         for label, plan in self.data["live"].items():
+            if not self.has_servers(plan):
+                continue
             try:
                 healthy = self.state.healthy(label, plan)
             except (RuntimeError, OSError, subprocess.SubprocessError):
@@ -212,12 +327,14 @@ class Bot:
             previous = self.last_health.get(label)
             now = time.monotonic()
             repair_due = now - self.repair_attempts.get(label, -600) >= 300
-            if not healthy and label in self.data["repair"] and repair_due:
+            repair_allowed = self.user is None or self.valid_license()
+            if not healthy and label in self.data["repair"] and repair_due and repair_allowed:
                 self.repair_attempts[label] = now
                 try:
+                    self.require_access(plan)
                     self.state.check_license(plan)
                     for side in ("iran", "abroad"):
-                        remote(plan[side], "restart", name=label)
+                        remote(plan[side], "restart", name=self.state.unit(label))
                     time.sleep(3)
                     healthy = self.state.healthy(label, plan)
                 except (RuntimeError, ValueError, OSError, subprocess.SubprocessError):
@@ -229,9 +346,9 @@ class Bot:
             else:
                 message = f"تانل {label} دوباره سالم است." if healthy else f"تانل {label} نیازمند بررسی است."
             self.last_health[label] = healthy
-            for admin in self.admins:
+            for recipient in ({self.user} if self.user is not None else self.admins):
                 try:
-                    self.tg.send(admin, message)
+                    self.tg.send(recipient, message)
                 except RuntimeError:
                     logging.warning("Could not send health notification")
 
@@ -249,7 +366,7 @@ class Bot:
         while True:
             try:
                 events = self.tg.call("getUpdates", offset=self.data.get("offset", 0),
-                                      timeout=15, allowed_updates=["message"])
+                                      timeout=15, allowed_updates=["message", "callback_query"])
             except RuntimeError:
                 logging.warning("Telegram polling failed")
                 time.sleep(5)
@@ -257,30 +374,87 @@ class Bot:
             for event in events:
                 self.data["offset"] = event["update_id"] + 1
                 self.state.save()
-                msg = event.get("message", {})
-                chat = msg.get("chat", {})
-                sender = msg.get("from", {})
-                tokens = msg.get("text", "").split()
-                if chat.get("type") != "private" or sender.get("id") not in self.admins or not tokens:
-                    continue
-                command, *args = tokens
-                try:
-                    reply = self.execute(command.split("@")[0], args, chat["id"])
-                except KeyError:
-                    reply = "سرور، تانل، نسخهٔ قبلی یا لایسنس پیدا نشد."
-                except (RuntimeError, ValueError) as error:
-                    reply = str(error)
-                except (OSError, subprocess.SubprocessError):
-                    reply = "عملیات ناموفق بود. وضعیت شبکه و سرویس را بررسی کنید."
-                if reply is None:
+                if self.handle(event):
                     return 75
-                try:
-                    self.tg.send(chat["id"], reply)
-                except RuntimeError:
-                    logging.warning("Could not send command response")
             if time.monotonic() - last_monitor >= 60:
                 self.monitor()
+                for user, data in self.directory.get("users", {}).items():
+                    if data["live"]:
+                        self.session(int(user)).monitor()
                 last_monitor = time.monotonic()
+
+    def session(self, user):
+        if user in self.admins:
+            return self
+        if user not in self.sessions:
+            self.sessions[user] = Bot(self.state.scoped(user), self.tg, self.admins, user=user)
+        return self.sessions[user]
+
+    def handle(self, event):
+        callback = event.get("callback_query")
+        msg = callback.get("message", {}) if callback else event.get("message", {})
+        chat = msg.get("chat", {})
+        user = (callback or msg).get("from", {}).get("id")
+        if chat.get("type") != "private" or user != chat.get("id") or not isinstance(user, int):
+            return False
+        admin = user in self.admins
+        session = self.session(user)
+        markup = keyboard(admin)
+        try:
+            if callback:
+                self.tg.call("answerCallbackQuery", callback_query_id=callback["id"])
+                self.prompts.pop(user, None)
+                key = callback.get("data")
+                allowed = {item["callback_data"] for row in markup["inline_keyboard"] for item in row}
+                if admin:
+                    allowed.update((*LICENSE_BUTTONS, "confirm-update"))
+                if key not in allowed:
+                    return False
+                if key == "license":
+                    submenu = {"inline_keyboard": [
+                        [{"text": BUTTONS[item][0], "callback_data": item}] for item in LICENSE_BUTTONS
+                    ]}
+                    self.tg.send(user, "مدیریت لایسنس", submenu)
+                    return False
+                if key == "update":
+                    confirm = {"inline_keyboard": [[
+                        {"text": BUTTONS["confirm-update"][0], "callback_data": "confirm-update"}
+                    ]]}
+                    self.tg.send(user, "نسخهٔ جدید ربات از شاخهٔ main دریافت شود؟", confirm)
+                    return False
+                _, command, prompt = BUTTONS[key]
+                if prompt:
+                    if key not in {"activate", "server", "grant", "status"}:
+                        session.require_access()
+                    self.prompts[user] = command
+                    self.tg.send(user, prompt)
+                    return False
+                command, *args = command.split()
+            else:
+                tokens = msg.get("text", "").split()
+                if not tokens:
+                    return False
+                if tokens[0].startswith("/"):
+                    self.prompts.pop(user, None)
+                    command, *args = tokens
+                    command = command.split("@")[0]
+                else:
+                    command, *prefix = self.prompts.pop(user, "/help").split()
+                    args = prefix + tokens
+            reply = session.execute(command, args, user)
+        except KeyError:
+            reply = "سرور، تانل، نسخهٔ قبلی یا لایسنس پیدا نشد."
+        except (RuntimeError, ValueError) as error:
+            reply = str(error)
+        except (OSError, subprocess.SubprocessError):
+            reply = "عملیات ناموفق بود. وضعیت شبکه و سرویس را بررسی کنید."
+        if reply is None:
+            return True
+        try:
+            self.tg.send(user, reply, markup)
+        except RuntimeError:
+            logging.warning("Could not send command response")
+        return False
 
 
 def main():

@@ -102,7 +102,7 @@ def result(req):
         return round(time.monotonic() - start, 5)
 
     name = req["name"]
-    if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", name):
+    if not re.fullmatch(r"[a-z][a-z0-9_-]{0,49}", name):
         raise ValueError("invalid service name")
     unit = f"atuotunnel-{name}.service"
     if action in {"test", "echo", "stop-test"}:

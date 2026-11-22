@@ -154,13 +154,29 @@ def benchmark(plan, current=None):
 
 
 class State:
+    @staticmethod
+    def empty():
+        return {"drafts": {}, "live": {}, "previous": {}, "pending": None, "repair": [], "licenses": {}}
+
     def __init__(self, path):
         self.path = path
-        self.data = json.loads(path.read_text()) if path.exists() else {
-            "drafts": {}, "live": {}, "previous": {}, "pending": None, "repair": [], "licenses": {},
-        }
+        self.data = json.loads(path.read_text()) if path.exists() else self.empty()
+        self.root = self
+        self.prefix = ""
+
+    def scoped(self, user):
+        scope = State.__new__(State)
+        scope.root = self
+        scope.prefix = f"u{int(user)}_"
+        scope.data = self.data.setdefault("users", {}).setdefault(str(user), self.empty())
+        return scope
+
+    def unit(self, tunnel):
+        return self.prefix + tunnel
 
     def save(self):
+        if self.root is not self:
+            return self.root.save()
         with tempfile.NamedTemporaryFile(mode="w", dir=self.path.parent, delete=False) as file:
             try:
                 json.dump(self.data, file)
@@ -172,13 +188,13 @@ class State:
 
     def healthy(self, tunnel, plan):
         return (
-            all(remote(plan[side], "connected", name=tunnel) for side in ("iran", "abroad"))
+            all(remote(plan[side], "connected", name=self.unit(tunnel)) for side in ("iran", "abroad"))
             and all(remote(plan["iran"], "online", ports=[source for source, _ in plan["ports"]]))
             and all(remote(plan["abroad"], "online", ports=[target for _, target in plan["ports"]]))
         )
 
     def snapshot(self, tunnel, plan):
-        return {side: remote(plan[side], "snapshot", name=tunnel) for side in ("iran", "abroad")}
+        return {side: remote(plan[side], "snapshot", name=self.unit(tunnel)) for side in ("iran", "abroad")}
 
     def restore(self, transaction):
         failures = []
@@ -205,7 +221,7 @@ class State:
         self.check_license(plan)
         current = self.data["live"].get(tunnel)
         check_ports(plan, current)
-        transaction = {"name": tunnel, "hosts": plan, "files": self.snapshot(tunnel, plan),
+        transaction = {"name": self.unit(tunnel), "hosts": plan, "files": self.snapshot(tunnel, plan),
                        "plan": current}
         if not current and any(snap["unit"] or snap["config"] or snap["active"]
                                for snap in transaction["files"].values()):
@@ -213,7 +229,7 @@ class State:
         self.data["pending"] = transaction
         self.save()
         try:
-            for side, args in configs(plan, tunnel, plan["transport"]).items():
+            for side, args in configs(plan, self.unit(tunnel), plan["transport"]).items():
                 remote(plan[side], "apply", **args)
             for _ in range(4):
                 time.sleep(2)
@@ -233,7 +249,7 @@ class State:
         self.recover()
         previous = self.data["previous"][tunnel]
         current = self.data["live"][tunnel]
-        transaction = {"name": tunnel, "hosts": current, "files": self.snapshot(tunnel, current),
+        transaction = {"name": self.unit(tunnel), "hosts": current, "files": self.snapshot(tunnel, current),
                        "plan": current}
         self.data["pending"] = transaction
         self.save()
