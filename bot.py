@@ -50,7 +50,7 @@ USER_HELP = """🎒 BackPack Smart Tunnel Manager
 """
 
 BUTTONS = {
-    "new": ("ایجاد تانل", "/new", "نام تانل، نام سرور ایران، نام سرور خارج و پورت کنترل را وارد کنید.\nنمونه: xray ir de 3080"),
+    "new": ("ایجاد تانل", "/new", None),
     "ports": ("مدیریت پورت‌ها", "/ports", "نام تانل و نگاشت پورت‌ها را وارد کنید.\nنمونه: xray 443,8443,2053:3000"),
     "test": ("تست هوشمند", "/test", "نام تانل را وارد کنید. برای نصب خودکار پس از تست، auto را اضافه کنید."),
     "install": ("تأیید نصب", "/install", "نام تانل تست‌شده را وارد کنید."),
@@ -113,6 +113,7 @@ class Bot:
         self.directory = state.root.data
         self.servers = self.directory.setdefault("servers", {})
         self.prompts = {}
+        self.tunnel_forms = {}
         self.server_form = {}
         self.sessions = {}
         self.repair_attempts = {}
@@ -460,6 +461,82 @@ class Bot:
             self.sessions[user] = Bot(self.state.scoped(user), self.tg, self.admins, user=user)
         return self.sessions[user]
 
+    def start_tunnel_form(self, user, session):
+        session.require_access()
+        if len({host["ip"] for host in session.available_servers().values()}) < 2:
+            raise ValueError("برای ساخت تانل، ابتدا دو سرور با IP متفاوت ثبت کنید: یک سرور ایران و یک سرور خارج.")
+        self.tunnel_forms[user] = {"id": secrets.token_hex(5), "step": "iran"}
+        self.show_tunnel_step(user, session)
+
+    def show_tunnel_step(self, user, session):
+        form = self.tunnel_forms[user]
+        step, token = form["step"], form["id"]
+        rows = []
+        if step in {"iran", "abroad"}:
+            servers = session.available_servers()
+            options = [(label, host) for label, host in servers.items()
+                       if step == "iran" or host["ip"] != form["iran_ip"]]
+            page = form.get("page", 0)
+            for label, host in options[page * 8:(page + 1) * 8]:
+                rows.append([{"text": f"{label} · {host['ip']}", "callback_data": f"tn:{token}:{step}:{label}"}])
+            navigation = []
+            for title, target in (("قبلی", page - 1), ("بعدی", page + 1)):
+                if 0 <= target and target * 8 < len(options):
+                    navigation.append({"text": title, "callback_data": f"tn:{token}:{step}:#{target}"})
+            if navigation:
+                rows.append(navigation)
+            prompt = ("۱ از ۴ · سرور داخل ایران را انتخاب کنید. کاربران به این سرور وصل می‌شوند."
+                      if step == "iran" else
+                      "۲ از ۴ · سرور خارج از ایران را انتخاب کنید. سرویس مقصد روی این سرور است.")
+        elif step == "name":
+            prompt = "۳ از ۴ · یک نام انگلیسی برای تانل بفرستید. نمونه: xray"
+        else:
+            prompt = ("۴ از ۴ · پورت کنترل را انتخاب کنید. سرور خارج از این پورت برای اتصال به سرور ایران استفاده می‌کند. "
+                      "اگر 3080 آزاد است، دکمهٔ زیر را بزنید. در غیر این صورت شمارهٔ یک پورت TCP آزاد روی سرور ایران را بفرستید.")
+            rows.append([{"text": "استفاده از 3080", "callback_data": f"tn:{token}:control:3080"}])
+        rows.append([{"text": "لغو", "callback_data": f"tn:{token}:{step}:cancel:"}])
+        self.tg.send(user, prompt, {"inline_keyboard": rows})
+
+    def finish_tunnel_form(self, user, session, value):
+        form = self.tunnel_forms[user]
+        control = port(value)
+        servers = session.available_servers()
+        if control == servers[form["iran"]]["port"]:
+            raise ValueError("این پورت برای SSH سرور ایران استفاده می‌شود. پورت دیگری بفرستید.")
+        reply = session.execute("/new", [form["name"], form["iran"], form["abroad"], str(control)], user)
+        del self.tunnel_forms[user]
+        self.tg.send(user, f"{reply} نام تانل: {form['name']}", keyboard(user in self.admins))
+
+    def tunnel_callback(self, user, session, key):
+        form = self.tunnel_forms.get(user)
+        parts = key.split(":", 3)
+        if not form or len(parts) != 4 or parts[1:3] != [form["id"], form["step"]]:
+            return
+        value = parts[3]
+        if value == "cancel:":
+            del self.tunnel_forms[user]
+            self.tg.send(user, "ساخت تانل لغو شد.", keyboard(user in self.admins))
+            return
+        session.require_access()
+        step = form["step"]
+        if step in {"iran", "abroad"} and value.startswith("#") and value[1:].isdigit():
+            form["page"] = int(value[1:])
+        elif step in {"iran", "abroad"}:
+            servers = session.available_servers()
+            if value not in servers or step == "abroad" and servers[value]["ip"] == form["iran_ip"]:
+                raise ValueError("یکی از سرورهای موجود در همین مرحله را انتخاب کنید.")
+            form[step] = value
+            if step == "iran":
+                form.update(step="abroad", iran_ip=servers[value]["ip"], page=0)
+            else:
+                form["step"] = "name"
+        elif step == "control" and value == "3080":
+            self.finish_tunnel_form(user, session, value)
+            return
+        else:
+            return
+        self.show_tunnel_step(user, session)
+
     def handle(self, event):
         callback = event.get("callback_query")
         msg = callback.get("message", {}) if callback else event.get("message", {})
@@ -474,13 +551,20 @@ class Bot:
             if callback:
                 self.tg.call("answerCallbackQuery", callback_query_id=callback["id"])
                 self.prompts.pop(user, None)
-                key = callback.get("data")
+                key = callback.get("data", "")
+                if key.startswith("tn:"):
+                    self.tunnel_callback(user, session, key)
+                    return False
                 allowed = {item["callback_data"] for row in markup["inline_keyboard"] for item in row}
                 if admin:
                     allowed.update((*LICENSE_BUTTONS, "confirm-update"))
                 if key not in allowed:
                     return False
                 session.server_form = {}
+                self.tunnel_forms.pop(user, None)
+                if key == "new":
+                    self.start_tunnel_form(user, session)
+                    return False
                 if key == "license":
                     submenu = {"inline_keyboard": [
                         [{"text": BUTTONS[item][0], "callback_data": item}] for item in LICENSE_BUTTONS
@@ -505,6 +589,23 @@ class Bot:
                 message_text = msg.get("text")
                 if not message_text:
                     return False
+                form = self.tunnel_forms.get(user)
+                if form:
+                    if message_text in {"/cancel", "/start", "/help"}:
+                        self.tunnel_forms.pop(user)
+                    else:
+                        session.require_access()
+                        if form["step"] == "name":
+                            label = name(message_text.strip())
+                            if label in session.data["drafts"] or label in session.data["live"]:
+                                raise ValueError("این نام قبلاً برای یک تانل استفاده شده است. نام دیگری بفرستید.")
+                            form.update(step="control", name=label)
+                            self.show_tunnel_step(user, session)
+                        elif form["step"] == "control":
+                            self.finish_tunnel_form(user, session, message_text.strip())
+                        else:
+                            self.show_tunnel_step(user, session)
+                        return False
                 if session.server_form and message_text not in {"/cancel", "/start", "/help"}:
                     reply = session.continue_server_form(message_text, user, msg["message_id"])
                     self.tg.send(user, reply, markup if not session.server_form else None)
@@ -521,6 +622,9 @@ class Bot:
                 else:
                     command, *prefix = self.prompts.pop(user, "/help").split()
                     args = prefix + tokens
+            if command == "/new" and not args:
+                self.start_tunnel_form(user, session)
+                return False
             reply = session.execute(command, args, user)
         except KeyError:
             reply = "سرور، تانل، نسخهٔ قبلی یا لایسنس پیدا نشد."
@@ -531,7 +635,7 @@ class Bot:
         if reply is None:
             return True
         try:
-            self.tg.send(user, reply, markup if not session.server_form else None)
+            self.tg.send(user, reply, markup if not session.server_form and user not in self.tunnel_forms else None)
         except RuntimeError:
             logging.warning("Could not send command response")
         return False
