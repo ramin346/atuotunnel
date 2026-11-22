@@ -12,7 +12,7 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parent
-TRANSPORTS = ("tcp", "tcpmux")
+TRANSPORTS = ("tcp", "tcpmux", "ws", "wsmux", "wss", "wssmux")
 MAX_PORTS = 16
 
 
